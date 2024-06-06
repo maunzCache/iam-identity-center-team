@@ -1,0 +1,532 @@
+#!/usr/bin/env bash
+
+declare DEPLOYMENT_TEMPLATE="template.yml"
+declare REPOSITORY_NAME="team-idc-app"
+declare STACK_NAME="TEAM-IDC-APP"
+declare USER_POOL_NAME="team06dbb7fc" # Do not change
+declare GIT_BRANCH="main"             # Do not change (for now)
+declare GITHUB_REPO_URL="https://github.com/aws-samples/iam-identity-center-team.git"
+
+_usage() {
+    echo "CLI to manage a TEAM installation with a delegated admin account."
+    echo "To use a management account, manually create a copy from 'parameters-mgmt-template.sh' and do not run '-i'."
+    echo "Options are non-exclusive and can be called in any order."
+    echo ""
+    echo "Usage: team-cli [OPTION]"
+    echo ""
+    echo -e "  -a\t\tset up machine authentication"
+    echo -e "  -c <value>\tvalues: 'sso-admin' or 'cognito'. get config values from the deployment. requires manual steps afterwards."
+    echo -e "  -d\t\tdeploy TEAM to AWS"
+    echo -e "  -i\t\tinitiate config"
+    echo -e "  -r\t\tremove the deployment from AWS"
+    echo -e "  -u\t\tupdate to a newer TEAM version. must not be used to downgrade"
+    echo ""
+    echo "Fully install TEAM:"
+    echo "  team-cli -id -c sso-admin -c cognito -a"
+    echo ""
+    echo "Update TEAM:"
+    echo "  team-cli -u"
+    echo ""
+    echo "Remove TEAM:"
+    echo "  team-cli -r"
+    echo ""
+    echo "Documentation: https://aws-samples.github.io/iam-identity-center-team/"
+    echo "Github: https://github.com/aws-samples/iam-identity-center-team"
+}
+
+check_requirements() {
+    echo "INFO: Checking requirements"
+    local BINARIES=("nano" "git" "aws" "jq" "python3" "pip3")
+
+    for BINARY in "${BINARIES[@]}"; do
+        command -v "${BINARY}" >/dev/null 2>&1 || echo "ERR: Command ${BINARY} was not found."
+    done
+
+    # pip3 show git-remote-codecommit >/dev/null 2>&1 || echo "ERR: git-remote-codecommit was not found."
+
+    local WORKING_DIR
+    WORKING_DIR=$(pwd)
+    if [[ ! "${WORKING_DIR}" =~ "/deployment"$ ]]; then
+        echo "ERR: Current working directory should be '/deployment'."
+        return 1
+    fi
+}
+
+check_and_prepare_parameters() {
+    echo "INFO: Check for parameters.sh"
+
+    # Sanity checks
+    if [[ ! -f "parameters-template.sh" ]]; then
+        echo "ERR: parameters-template.sh was not found."
+        return 1
+    fi
+
+    if [[ ! -f "parameters.sh" ]]; then
+        echo "WARN: parameters.sh was not found. Creating..."
+        cp -n "parameters-template.sh" "parameters.sh"
+
+        # TODO: Find a way to support a "default" editor
+        nano "parameters.sh"
+    fi
+
+    # shellcheck source=/dev/null
+    source "./parameters.sh"
+}
+
+check_and_prepare_details() {
+    echo "INFO: Check for details.json"
+
+    # Sanity checks
+    if [[ ! -f "details-template.json" ]]; then
+        echo "ERR: details-template.json was not found."
+        return 1
+    fi
+
+    if [[ ! -f "details.json" ]]; then
+        echo "WARN: details.json was not found. Creating..."
+        cp -n "details-template.json" "details.json"
+
+        # TODO: Find a way to support a "default" editor
+        nano "details.json"
+    fi
+}
+
+set_aws_env() {
+    echo "INFO: Set AWS_ environment variables"
+    export AWS_PROFILE="${ORG_MASTER_PROFILE}"
+    # Note: Dropped --region parameter in favor of the env var
+    export AWS_DEFAULT_REGION="${REGION}"
+
+    # TODO: Consider running "aws login"
+    echo "INFO: Check login credentials"
+    if [[ ! $(aws sts get-caller-identity >/dev/null) ]]; then echo "Exiting... "; fi
+}
+
+unset_aws_env() {
+    unset AWS_PROFILE
+    unset AWS_DEFAULT_REGION
+}
+
+init_team() {
+    echo "INFO: Run 'init'"
+    # TODO: There are various options set throught the functions such as e and x.
+    # Find a way to limit those to a single function.
+    set +e
+
+    # check_and_prepare_parameters
+    # set_aws_env
+
+    local idc
+    local cloudtrail
+    local accountManager
+    local serviceRole
+
+    # TODO: Fail early. Maybe there is a trap for it, else wrap the current code in a function or something
+    # Or have a state kind of
+    idc=$(aws organizations list-delegated-administrators --service-principal sso.amazonaws.com --output json | jq --raw-output '.DelegatedAdministrators[] | select(.Id=='\"${TEAM_ACCOUNT}\"') | .Id')
+    if [ -n "${?}" ]; then exit; fi
+
+    cloudtrail=$(aws organizations list-delegated-administrators --service-principal cloudtrail.amazonaws.com --output json | jq --raw-output '.DelegatedAdministrators[] | select(.Id=='\"${TEAM_ACCOUNT}\"') | .Id')
+    if [ -n "${?}" ]; then exit; fi
+
+    accountManager=$(aws organizations list-delegated-administrators --service-principal account.amazonaws.com --output json | jq --raw-output '.DelegatedAdministrators[] | select(.Id=='\"${TEAM_ACCOUNT}\"') | .Id')
+    if [ -n "${?}" ]; then exit; fi
+
+    serviceRole=$(aws iam get-role --role-name AWSServiceRoleForCloudTrail)
+    if [ -n "${?}" ]; then exit; fi
+
+    # Enable trusted access for account management
+    aws organizations enable-aws-service-access --service-principal account.amazonaws.com
+
+    # Enable Delegated Admin for Account Management
+    if [ -z "${accountManager}" ]; then
+        aws organizations register-delegated-administrator \
+            --account-id "${TEAM_ACCOUNT}" \
+            --service-principal account.amazonaws.com
+
+        echo "${TEAM_ACCOUNT} configured as delegated Admin for AWS Account Manager"
+    else
+        echo "${TEAM_ACCOUNT} is already configured as delegated Admin for AWS Account Manager"
+    fi
+
+    # Enable trusted access for CloudTrail
+    aws organizations enable-aws-service-access --service-principal cloudtrail.amazonaws.com
+
+    if [ -z "${serviceRole}" ]; then
+        aws iam create-service-linked-role --aws-service-name cloudtrail.amazonaws.com
+    fi
+
+    # Enable Delegated Admin for CloudTrail
+    if [ -z "${cloudtrail}" ]; then
+        aws organizations register-delegated-administrator \
+            --account-id "${TEAM_ACCOUNT}" \
+            --service-principal cloudtrail.amazonaws.com
+        echo "${TEAM_ACCOUNT} configured as delegated Admin for cloudtrail"
+    else
+        echo "${TEAM_ACCOUNT} is already configured as delegated Admin for cloudtrail"
+    fi
+
+    # Enable trusted access for IdC
+    aws organizations enable-aws-service-access --service-principal sso.amazonaws.com
+
+    # Enable Delegated Admin for IdC
+    if [ -z "${idc}" ]; then
+        aws organizations register-delegated-administrator \
+            --account-id "${TEAM_ACCOUNT}" \
+            --service-principal sso.amazonaws.com
+
+        echo "${TEAM_ACCOUNT} configured as delegated Admin for IAM IdC"
+    else
+        echo "${TEAM_ACCOUNT} is already configured as delegated Admin for IAM IdC"
+    fi
+}
+
+init_team
+
+deploy_team() {
+    echo "INFO: Run 'deployment'"
+    set -xe
+
+    check_and_prepare_parameters
+
+    # TODO: Replace with "set_aws_env"
+    if [ -z "${TEAM_ACCOUNT}" ]; then
+        export AWS_PROFILE="${ORG_MASTER_PROFILE}"
+    else
+        export AWS_PROFILE="${TEAM_ACCOUNT_PROFILE}"
+    fi
+    # Note: Dropped --region parameter in favor of the env var
+    export AWS_DEFAULT_REGION="${REGION}"
+
+    # TODO: Check for .git folder
+    cd ..
+
+    # TODO: Implement something that has a better release workflow management
+    aws codecommit create-repository --repository-name "${REPOSITORY_NAME}" --repository-description "Temporary Elevated Access Management (TEAM) Application"
+    git remote remove origin
+    git remote add origin "codecommit::${AWS_DEFAULT_REGION}://${REPOSITORY_NAME}"
+    git push origin "${GIT_BRANCH}"
+    # TODO: Push tags!
+
+    cd ./deployment
+    # TODO: Figure out tags. Cannot use space character btw
+    if [[ -n "${TAGS}" ]]; then
+        if [[ -n "${UI_DOMAIN}" ]]; then
+            aws cloudformation deploy --template-file "${DEPLOYMENT_TEMPLATE}" \
+                --stack-name "${STACK_NAME}" \
+                --parameter-overrides \
+                Login="${IDC_LOGIN_URL}" \
+                CloudTrailAuditLogs="${CLOUDTRAIL_AUDIT_LOGS}" \
+                teamAdminGroup="${TEAM_ADMIN_GROUP}" \
+                teamAuditGroup="${TEAM_AUDITOR_GROUP}" \
+                tags="${TAGS}" \
+                teamAccount="${TEAM_ACCOUNT}" \
+                customAmplifyDomain="${UI_DOMAIN}" \
+                --tags ${TAGS} \
+                --no-fail-on-empty-changeset --capabilities CAPABILITY_NAMED_IAM
+        else
+            aws cloudformation deploy --template-file "${DEPLOYMENT_TEMPLATE}" \
+                --stack-name "${STACK_NAME}" \
+                --parameter-overrides \
+                Login="${IDC_LOGIN_URL}" \
+                CloudTrailAuditLogs="${CLOUDTRAIL_AUDIT_LOGS}" \
+                teamAdminGroup="${TEAM_ADMIN_GROUP}" \
+                teamAuditGroup="${TEAM_AUDITOR_GROUP}" \
+                tags="${TAGS}" \
+                teamAccount="${TEAM_ACCOUNT}" \
+                --tags ${TAGS} \
+                --no-fail-on-empty-changeset --capabilities CAPABILITY_NAMED_IAM
+        fi
+    else
+        if [[ -n "${UI_DOMAIN}" ]]; then
+            aws cloudformation deploy --template-file "${DEPLOYMENT_TEMPLATE}" \
+                --stack-name "${STACK_NAME}" \
+                --parameter-overrides \
+                Login="${IDC_LOGIN_URL}" \
+                CloudTrailAuditLogs="${CLOUDTRAIL_AUDIT_LOGS}" \
+                teamAdminGroup="${TEAM_ADMIN_GROUP}" \
+                teamAuditGroup="${TEAM_AUDITOR_GROUP}" \
+                teamAccount="${TEAM_ACCOUNT}" \
+                tags="${TAGS}" \
+                customAmplifyDomain="${UI_DOMAIN}" \
+                --no-fail-on-empty-changeset --capabilities CAPABILITY_NAMED_IAM
+        else
+            aws cloudformation deploy --template-file "${DEPLOYMENT_TEMPLATE}" \
+                --stack-name "${STACK_NAME}" \
+                --parameter-overrides \
+                Login="${IDC_LOGIN_URL}" \
+                CloudTrailAuditLogs="${CLOUDTRAIL_AUDIT_LOGS}" \
+                teamAdminGroup="${TEAM_ADMIN_GROUP}" \
+                teamAuditGroup="${TEAM_AUDITOR_GROUP}" \
+                teamAccount="${TEAM_ACCOUNT}" \
+                --no-fail-on-empty-changeset --capabilities CAPABILITY_NAMED_IAM
+        fi
+    fi
+}
+
+configure_sso_admin_team() {
+    echo "INFO: Run 'configure sso-admin'"
+    check_and_prepare_parameters
+
+    # TODO: Replace with "set_aws_env"
+    if [ -z "${TEAM_ACCOUNT}" ]; then
+        export AWS_PROFILE="${ORG_MASTER_PROFILE}"
+    else
+        export AWS_PROFILE="${TEAM_ACCOUNT_PROFILE}"
+    fi
+    # Note: Dropped --region parameter in favor of the env var
+    export AWS_DEFAULT_REGION="${REGION}"
+
+    # TODO: Might override custom set shell vars
+    local green='\033[0;32m'
+    local clear='\033[0m'
+
+    # TODO: Fails if result is on another page
+    local cognitoUserpoolId=$(aws cognito-idp list-user-pools --max-results 10 --output json | jq --raw-output '.UserPools[] | select(.Name | contains('\"${USER_POOL_NAME}\"')) | .Id')
+    local cognitouserpoolhostedUIdomain=$(aws cognito-idp describe-user-pool --user-pool-id "${cognitoUserpoolId}" --output json | jq --raw-output '.UserPool.Domain')
+    local cognitoClientWebClientID=$(aws cognito-idp list-user-pool-clients --user-pool-id "${cognitoUserpoolId}" --output json | jq --raw-output '.UserPoolClients[] | select(.ClientName | contains("clientWeb")) | .ClientId')
+    local cognitoHostedUIdomain="${cognitouserpoolhostedUIdomain}.auth.${AWS_DEFAULT_REGION}.amazoncognito.com"
+
+    local ampliy_apps=$(aws amplify list-apps --output json)
+    local amplifyAppId=$(echo "${ampliy_apps}" | jq --raw-output '.apps[] | select(.name=='\"${STACK_NAME}\"') | .appId')
+    local amplifyDomain=$(echo "${ampliy_apps}" | jq --raw-output '.apps[] | select(.name=='\"${STACK_NAME}\"') | .defaultDomain')
+    local amplifyDomain="main.${amplifyDomain}"
+
+    local amplifyCustomDomains=$(aws amplify list-domain-associations --app-id "${amplifyAppId}" --output json)
+    local amplifyCustomDomain=$(echo "${amplifyCustomDomains}" | jq --raw-output 'select(.domainAssociations | length > 0) | .domainAssociations[0].domainName')
+
+    if [ -n "${amplifyCustomDomain}" ]; then
+        amplifyCustomDomainPrefix=$(echo "${amplifyCustomDomains}" | jq --raw-output 'select(.domainAssociations | length > 0) | .domainAssociations[0].subDomains[] | select(.subDomainSetting.branchName=='\"${GIT_BRANCH}\"') | .subDomainSetting.prefix')
+        amplifyDomain=$([ -z "${amplifyCustomDomainPrefix}" ] && echo "${amplifyCustomDomain}" || echo "${amplifyCustomDomainPrefix}.${amplifyCustomDomain}")
+    fi
+
+    echo "${amplifyDomain}"
+    local applicationStartURL="https://${cognitoHostedUIdomain}/authorize?client_id=${cognitoClientWebClientID}&response_type=code&scope=aws.cognito.signin.user.admin+email+openid+phone+profile&redirect_uri=https://${amplifyDomain}/&idp_identifier=team"
+    local applicationACSURL="https://${cognitoHostedUIdomain}/saml2/idpresponse"
+    local applicationSAMLAudience="urn:amazon:cognito:sp:${cognitoUserpoolId}"
+
+    printf "\n${green}applicationStartURL:${clear} %s\n${green}applicationACSURL:${clear} %s\n${green}applicationSAMLAudience:${clear} %s\n\n" "${applicationStartURL}" "${applicationACSURL}" "${applicationSAMLAudience}"
+}
+
+configure_cognito_team() {
+    echo "INFO: Run 'configure cognito'"
+    check_and_prepare_parameters
+    check_and_prepare_details
+
+    # TODO: Replace with "set_aws_env"
+    if [ -z "${TEAM_ACCOUNT}" ]; then
+        export AWS_PROFILE="${ORG_MASTER_PROFILE}"
+    else
+        export AWS_PROFILE="${TEAM_ACCOUNT_PROFILE}"
+    fi
+    # Note: Dropped --region parameter in favor of the env var
+    export AWS_DEFAULT_REGION="${REGION}"
+
+    # TODO: Check if that can be reused from above
+    local cognitoUserpoolId=$(aws cognito-idp list-user-pools --max-results 10 --output json | jq --raw-output '.UserPools[] | select(.Name | contains('\"${USER_POOL_NAME}\"')) | .Id')
+    local clientID=$(aws cognito-idp list-user-pool-clients --user-pool-id "${cognitoUserpoolId}" --output json | jq --raw-output '.UserPoolClients[] | select(.ClientName | contains("clientWeb")) | .ClientId')
+
+    local amplifyAppId=$(aws amplify list-apps --output json | jq --raw-output '.apps[] | select(.name=='\"${STACK_NAME}\"') | .appId')
+    local amplifyDomain=$(aws amplify list-apps --output json | jq --raw-output '.apps[] | select(.name=='\"${STACK_NAME}\"') | .defaultDomain')
+    local amplifyDomain="main.${amplifyDomain}"
+
+    local amplifyCustomDomains=$(aws amplify list-domain-associations --app-id "${amplifyAppId}" --output json)
+    local amplifyCustomDomain=$(echo "${amplifyCustomDomains}" | jq --raw-output 'select(.domainAssociations | length > 0) | .domainAssociations[0].domainName')
+
+    if [ -n "$amplifyCustomDomain" ]; then
+        amplifyCustomDomainPrefix=$(echo "${amplifyCustomDomains}" | jq --raw-output 'select(.domainAssociations | length > 0) | .domainAssociations[0].subDomains[] | select(.subDomainSetting.branchName=='\"${GIT_BRANCH}\"') | .subDomainSetting.prefix')
+        amplifyDomain=$([ -z "${amplifyCustomDomainPrefix}" ] && echo "${amplifyCustomDomain}" || echo "${amplifyCustomDomainPrefix}.${amplifyCustomDomain}")
+    fi
+
+    aws cognito-idp create-identity-provider --user-pool-id "${cognitoUserpoolId}" --provider-name=IDC --provider-type SAML --provider-details file://details.json --attribute-mapping email=Email --idp-identifiers team
+    aws cognito-idp update-user-pool-client --user-pool-id "${cognitoUserpoolId}" \
+        --client-id "${clientID}" \
+        --refresh-token-validity 1 \
+        --supported-identity-providers IDC \
+        --allowed-o-auth-flows code \
+        --allowed-o-auth-scopes "phone" "email" "openid" "profile" "aws.cognito.signin.user.admin" \
+        --logout-urls "https://${amplifyDomain}/" \
+        --callback-urls "https://${amplifyDomain}/" \
+        --allowed-o-auth-flows-user-pool-client
+}
+
+auth_team() {
+    echo "INFO: Run 'machine authentication'"
+    check_and_prepare_parameters
+
+    # TODO: Replace with "set_aws_env"
+    if [ -z "${TEAM_ACCOUNT}" ]; then
+        export AWS_PROFILE="${ORG_MASTER_PROFILE}"
+    else
+        export AWS_PROFILE="${TEAM_ACCOUNT_PROFILE}"
+    fi
+    # Note: Dropped --region parameter in favor of the env var
+    export AWS_DEFAULT_REGION="${REGION}"
+
+    local cognitoUserpoolId=$(aws cognito-idp list-user-pools --max-results 10 --output json | jq --raw-output '.UserPools[] | select(.Name | contains('\"${USER_POOL_NAME}\"')) | .Id')
+
+    # remove pager
+    export AWS_PAGER=""
+
+    # Create the resource server with the needed custom scopes
+    aws cognito-idp create-resource-server \
+        --user-pool-id "${cognitoUserpoolId}" \
+        --identifier "api" \
+        --name "api" \
+        --scopes "ScopeName=admin,ScopeDescription=Provides Admin access to machine authentication flows"
+
+    # Create the user pool client with a secret access key to allow machine auth
+    # TODO: Remove the localhost url. Its dangerous.
+    aws cognito-idp create-user-pool-client \
+        --user-pool-id "${cognitoUserpoolId}" \
+        --client-name machine_auth \
+        --generate-secret \
+        --explicit-auth-flows "ALLOW_REFRESH_TOKEN_AUTH" \
+        --supported-identity-providers "COGNITO" \
+        --callback-urls "https://localhost" \
+        --allowed-o-auth-flows "client_credentials" \
+        --allowed-o-auth-scopes "api/admin" \
+        --allowed-o-auth-flows-user-pool-client
+
+    local cognitoUserpoolId=$(aws cognito-idp list-user-pools --max-results 10 --output json | jq --raw-output '.UserPools[] | select(.Name | contains('\"${USER_POOL_NAME}\"')) | .Id')
+    local cognitoUserpoolDomain=$(aws cognito-idp describe-user-pool --user-pool-id "${cognitoUserpoolId}" --output json | jq --raw-output '.UserPool.Domain')
+    local cognitoUserpoolClientId=$(aws cognito-idp list-user-pool-clients --user-pool-id "${cognitoUserpoolId}" --output json | jq --raw-output '.UserPoolClients[] | select(.ClientName | contains("machine_auth")) | .ClientId')
+    local cognitoUserpoolClient=$(aws cognito-idp describe-user-pool-client --user-pool-id "${cognitoUserpoolId}" --client-id "${cognitoUserpoolClientId}" --output json | jq --raw-output '.UserPoolClient')
+    local graphEndpoint=$(aws appsync list-graphql-apis --output json | jq --raw-output '.graphqlApis[] | select(.name | contains("team-main")) | .uris.GRAPHQL')
+
+    echo "token_endpoint=\"https://${cognitoUserpoolDomain}.auth.${AWS_DEFAULT_REGION}.amazoncognito.com/oauth2/token\""
+    echo "graph_endpoint=\"${graphEndpoint}\""
+    echo "client_id=$(echo "${cognitoUserpoolClient}" | jq .ClientId)"
+    echo "client_secret=$(echo "${cognitoUserpoolClient}" | jq .ClientSecret)"
+}
+
+update_team() {
+    echo "INFO: Run 'update'"
+    # TODO: There might be some additional step necessary
+    # https://aws-samples.github.io/iam-identity-center-team/docs/deployment/update.html
+
+    set -xe
+
+    check_and_prepare_parameters
+
+    # TODO: Replace with "set_aws_env"
+    if [ -z "${TEAM_ACCOUNT}" ]; then
+        export AWS_PROFILE="${ORG_MASTER_PROFILE}"
+    else
+        export AWS_PROFILE="${TEAM_ACCOUNT_PROFILE}"
+    fi
+    # Note: Dropped --region parameter in favor of the env var
+    export AWS_DEFAULT_REGION="${REGION}"
+
+    git remote remove origin
+    git remote add origin "codecommit::${AWS_DEFAULT_REGION}://${REPOSITORY_NAME}"
+    git remote add team "${GITHUB_REPO_URL}"
+    git pull team "${GIT_BRANCH}"
+
+    # TODO: Most options/args are the same as in deploy_team()
+    if [[ -n "${TAGS}" ]]; then
+        if [[ -n "${UI_DOMAIN}" ]]; then
+            aws cloudformation deploy --template-file "${DEPLOYMENT_TEMPLATE}" \
+                --stack-name "${STACK_NAME}" \
+                --parameter-overrides \
+                Login="${IDC_LOGIN_URL}" \
+                CloudTrailAuditLogs="${CLOUDTRAIL_AUDIT_LOGS}" \
+                teamAdminGroup="${TEAM_ADMIN_GROUP}" \
+                teamAuditGroup="${TEAM_AUDITOR_GROUP}" \
+                tags="${TAGS}" \
+                teamAccount="${TEAM_ACCOUNT}" \
+                customAmplifyDomain="${UI_DOMAIN}" \
+                --tags ${TAGS} \
+                --no-fail-on-empty-changeset --capabilities CAPABILITY_NAMED_IAM
+        else
+            aws cloudformation deploy --template-file "${DEPLOYMENT_TEMPLATE}" \
+                --stack-name "${STACK_NAME}" \
+                --parameter-overrides \
+                Login="${IDC_LOGIN_URL}" \
+                CloudTrailAuditLogs="${CLOUDTRAIL_AUDIT_LOGS}" \
+                teamAdminGroup="${TEAM_ADMIN_GROUP}" \
+                teamAuditGroup="${TEAM_AUDITOR_GROUP}" \
+                tags="${TAGS}" \
+                teamAccount="${TEAM_ACCOUNT}" \
+                --tags ${TAGS} \
+                --no-fail-on-empty-changeset --capabilities CAPABILITY_NAMED_IAM
+        fi
+    else
+        if [[ -n "${UI_DOMAIN}" ]]; then
+            aws cloudformation deploy --template-file "${DEPLOYMENT_TEMPLATE}" \
+                --stack-name "${STACK_NAME}" \
+                --parameter-overrides \
+                Login="${IDC_LOGIN_URL}" \
+                CloudTrailAuditLogs="${CLOUDTRAIL_AUDIT_LOGS}" \
+                teamAdminGroup="${TEAM_ADMIN_GROUP}" \
+                teamAuditGroup="${TEAM_AUDITOR_GROUP}" \
+                teamAccount="${TEAM_ACCOUNT}" \
+                tags="${TAGS}" \
+                customAmplifyDomain="${UI_DOMAIN}" \
+                --no-fail-on-empty-changeset --capabilities CAPABILITY_NAMED_IAM
+        else
+            aws cloudformation deploy --template-file "${DEPLOYMENT_TEMPLATE}" \
+                --stack-name "${STACK_NAME}" \
+                --parameter-overrides \
+                Login="${IDC_LOGIN_URL}" \
+                CloudTrailAuditLogs="${CLOUDTRAIL_AUDIT_LOGS}" \
+                teamAdminGroup="${TEAM_ADMIN_GROUP}" \
+                teamAuditGroup="${TEAM_AUDITOR_GROUP}" \
+                teamAccount="${TEAM_ACCOUNT}" \
+                --no-fail-on-empty-changeset --capabilities CAPABILITY_NAMED_IAM
+        fi
+    fi
+
+    git push origin "${GIT_BRANCH}"
+    git remote remove team
+}
+
+destroy_team() {
+    echo "INFO: Run 'destroy'"
+    check_and_prepare_parameters
+
+    # TODO: Replace with "set_aws_env"
+    if [ -z "${TEAM_ACCOUNT}" ]; then
+        export AWS_PROFILE="${ORG_MASTER_PROFILE}"
+    else
+        export AWS_PROFILE="${TEAM_ACCOUNT_PROFILE}"
+    fi
+    # Note: Dropped --region parameter in favor of the env var
+    export AWS_DEFAULT_REGION="${REGION}"
+
+    local appId=$(aws amplify list-apps --output json | jq --raw-output '.apps[] | select(.name=='\"${STACK_NAME}\"') | .appId')
+    local stackName=$(aws amplify get-backend-environment --app-id "${appId}" --environment-name main --output json | jq --raw-output '.backendEnvironment | .stackName')
+
+    # TODO: Check if this removes everything
+    # https://aws-samples.github.io/iam-identity-center-team/docs/deployment/uninstall.html
+    aws cloudformation delete-stack --stack-name "${stackName}" # TODO: This is weird
+    aws cloudformation delete-stack --stack-name "${STACK_NAME}"
+    aws codecommit delete-repository --repository-name "${REPOSITORY_NAME}"
+}
+
+# TODO: opts richtig machen; wenn man die argumente in die richtige reihenfolge bringt, dann kann man auch mehrere parameter erlauben.
+# TODO: dry-run
+# TODO: Running "team-cli -id -c sso-admin -c cognito -a" only works the first time. consider an interactive flag
+while getopts 'adiru:c' OPT; do
+    case "${OPT}" in
+    'a') auth_team ;;
+    'c')
+        if [ "${OPTARG}" = "sso-admin" ]; then
+            configure_sso_admin_team
+        elif [ "${OPTARG}" = "cognito" ]; then
+            configure_cognito_team
+        fi
+        ;;
+    'd') deploy_team ;;
+    'i') init_team ;;
+    'r') destroy_team ;;
+    'u') update_team ;;
+    ?) _usage && exit ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# TODO should happen before any option
+check_requirements
+
+unset_aws_env
